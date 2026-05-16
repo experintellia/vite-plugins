@@ -1,33 +1,14 @@
-// Storage-layer tests for the IndexedDB-backed webxdc simulator.
-//
-// These exercise the *real published artifact* (`src/webxdc.js`) by evaluating
-// it as a classic script in a jsdom window with `fake-indexeddb` installed,
-// driving it only through the public webxdc API. Re-evaluating the source
-// simulates a page reload (a fresh closure over the same persisted database),
-// which is how migration idempotency is verified.
+// Storage-layer tests: IndexedDB persistence, legacy migration idempotency
+// (verified by re-evaluating the source to simulate a reload), and graceful
+// degradation when IndexedDB is unavailable.
 
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it } from "vitest";
-
-const SRC = readFileSync(path.join(process.cwd(), "src", "webxdc.js"), "utf-8");
-const UPDATES_KEY = "__xdcUpdatesKey__";
-const EPHEMERAL_KEY = "__xdcEphemeralUpdateKey__";
-
-// Evaluate src/webxdc.js as a classic script. Indirect eval runs in global
-// scope, so `window.webxdc = (() => { ... })()` assigns onto the jsdom window.
-// Each call creates a brand-new closure (a simulated reload).
-function loadStub() {
-  (0, eval)(SRC);
-  return window.webxdc;
-}
-
-function freshIndexedDB() {
-  const factory = new IDBFactory();
-  globalThis.indexedDB = factory;
-  window.indexedDB = factory;
-}
+import {
+  EPHEMERAL_KEY,
+  freshIndexedDB,
+  loadStub,
+  UPDATES_KEY,
+} from "./helpers.js";
 
 beforeEach(() => {
   window.localStorage.clear();

@@ -5,13 +5,11 @@
 // file is not used and will automatically be replaced with a real one.
 // See https://docs.webxdc.org/spec.html#webxdc-api
 //
-// Persistence note: the update log is stored in IndexedDB (one record per
-// update, keyed by `serial`) instead of a single re-serialized localStorage
-// value, so long dev/test sessions are not bounded by the ~5 MB localStorage
-// string quota. Existing `__xdcUpdatesKey__` localStorage data is migrated
-// automatically and once. Cross-window peer sync / realtime uses a
-// BroadcastChannel (IndexedDB has no cross-document change event), falling
-// back to localStorage when IndexedDB or BroadcastChannel is unavailable.
+// The update log is kept in IndexedDB (one record per update, keyed by
+// `serial`) so long dev sessions are not bounded by the ~5 MB localStorage
+// quota. Cross-window sync uses a BroadcastChannel because IndexedDB has no
+// cross-document change event, with a localStorage fallback when either is
+// unavailable.
 
 // @ts-check
 /** @typedef {import('@webxdc/types/global')} */
@@ -64,6 +62,11 @@ window.webxdc = (() => {
   // Used only when BroadcastChannel is unavailable: writing this key triggers
   // a cross-document `storage` event we use purely as a notification ping.
   const SIGNAL_KEY = "__xdcSimulatorSignal__";
+
+  // Cross-window message types.
+  const MSG_UPDATE = "update";
+  const MSG_RESET = "reset";
+  const MSG_EPHEMERAL = "ephemeral";
 
   /** @type {BroadcastChannel | null} */
   let channel = null;
@@ -131,7 +134,7 @@ window.webxdc = (() => {
       }
       // Ephemeral / realtime is transient and carries no persisted state.
       postToPeers({
-        type: "ephemeral",
+        type: MSG_EPHEMERAL,
         sender: window.webxdc.selfAddr,
         data: Array.from(data),
       });
@@ -406,11 +409,11 @@ window.webxdc = (() => {
     if (!message) {
       return;
     }
-    if (message.type === "reset") {
+    if (message.type === MSG_RESET) {
       window.location.reload();
       return;
     }
-    if (message.type === "update") {
+    if (message.type === MSG_UPDATE) {
       const update = message.update;
       console.log("[Webxdc] " + JSON.stringify(update));
       if (update.notify && update._sender !== window.webxdc.selfAddr) {
@@ -423,7 +426,7 @@ window.webxdc = (() => {
       deliverPeerUpdate(update);
       return;
     }
-    if (message.type === "ephemeral") {
+    if (message.type === MSG_EPHEMERAL) {
       // @ts-ignore: is_trashed() is private
       if (
         window.webxdc.selfAddr !== message.sender &&
@@ -522,7 +525,7 @@ window.webxdc = (() => {
         "Reset",
       );
       resetBtn.onclick = async () => {
-        postToPeers({ type: "reset" });
+        postToPeers({ type: MSG_RESET });
         try {
           await ready;
         } catch (e) {}
@@ -578,21 +581,11 @@ window.webxdc = (() => {
         updateListener = cb;
         listenerSet = true;
         lastDeliveredSerial = Math.max(serial, maxSerial);
-        // Flush peer updates that arrived during the async replay above and
-        // were not already covered by it.
+        // Flush peer updates that arrived during the async replay above;
+        // deliverPeerUpdate applies the same serial-based dedupe.
         const buffered = pendingPeerUpdates;
         pendingPeerUpdates = [];
-        buffered.forEach((update) => {
-          if (
-            typeof update.serial !== "number" ||
-            update.serial > lastDeliveredSerial
-          ) {
-            if (typeof update.serial === "number") {
-              lastDeliveredSerial = update.serial;
-            }
-            cb(update);
-          }
-        });
+        buffered.forEach(deliverPeerUpdate);
       }),
     joinRealtimeChannel: (cb) => {
       // @ts-ignore: is_trashed() is private
@@ -612,7 +605,7 @@ window.webxdc = (() => {
       enqueue(async () => {
         await ready;
         /** @type {any} */
-        const _update = {
+        const payload = {
           payload: update.payload,
           summary: update.summary,
           info: update.info,
@@ -620,24 +613,18 @@ window.webxdc = (() => {
           href: update.href,
           document: update.document,
         };
-        _update._sender = window.webxdc.selfAddr;
+        /** @type {any} */
+        const _update = Object.assign({}, payload, {
+          _sender: window.webxdc.selfAddr,
+        });
         const serial = await storeAppend(_update);
-        // Log line preserves the original shape (no _sender / max_serial).
         console.log(
-          `[Webxdc] ${JSON.stringify({
-            payload: _update.payload,
-            summary: _update.summary,
-            info: _update.info,
-            notify: _update.notify,
-            href: _update.href,
-            document: _update.document,
-            serial: serial,
-          })}`,
+          `[Webxdc] ${JSON.stringify(Object.assign({}, payload, { serial }))}`,
         );
         _update.max_serial = serial;
         lastDeliveredSerial = Math.max(lastDeliveredSerial, serial);
         updateListener(_update);
-        postToPeers({ type: "update", update: _update });
+        postToPeers({ type: MSG_UPDATE, update: _update });
       }),
     sendToChat: async (content) => {
       if (!content.file && !content.text) {

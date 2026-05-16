@@ -7,31 +7,14 @@
 // message posted on one channel instance is delivered to the other (Node's
 // BroadcastChannel does not echo to the sender), exactly like two browser tabs.
 
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it } from "vitest";
+import { freshIndexedDB, loadStub, tick, waitFor } from "./helpers.js";
 
-const SRC = readFileSync(path.join(process.cwd(), "src", "webxdc.js"), "utf-8");
 const hasBroadcastChannel = typeof globalThis.BroadcastChannel !== "undefined";
-
-function loadStub() {
-  (0, eval)(SRC);
-  return window.webxdc;
-}
-
-const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-async function waitFor(predicate) {
-  for (let i = 0; i < 100 && !predicate(); i++) {
-    await tick();
-  }
-}
 
 beforeEach(() => {
   window.localStorage.clear();
-  const factory = new IDBFactory();
-  globalThis.indexedDB = factory;
-  window.indexedDB = factory;
+  freshIndexedDB();
 });
 
 describe.skipIf(!hasBroadcastChannel)(
