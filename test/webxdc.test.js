@@ -7,6 +7,7 @@ import {
   EPHEMERAL_KEY,
   freshIndexedDB,
   loadStub,
+  tick,
   UPDATES_KEY,
 } from "./helpers.js";
 
@@ -172,8 +173,6 @@ describe("graceful degradation without IndexedDB", () => {
 // with no optimistic apply) is relying on stub-only behavior that does not hold
 // against real Delta Chat. These tests pin the async contract so the simulator
 // stays faithful.
-const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-
 describe("asynchronous update delivery (matches Delta Chat)", () => {
   it("does NOT invoke the listener synchronously nor on the next microtask", async () => {
     const w = loadStub();

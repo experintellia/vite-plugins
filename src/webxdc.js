@@ -154,8 +154,8 @@ window.webxdc = (() => {
     }
   }
 
-  let updateListener = (_) => {};
-  let listenerSet = false;
+  const noopListener = (_) => {};
+  let updateListener = noopListener;
   // Highest serial already handed to the listener. Updates are delivered (on a
   // later event-loop turn) only when serial > this, so a record that is both
   // replayed and broadcast is never delivered twice.
@@ -200,27 +200,38 @@ window.webxdc = (() => {
     });
   }
 
-  /** @returns {Promise<number>} */
-  function idbCount() {
+  /** @param {IDBRequest} req @returns {Promise<any>} */
+  function reqToPromise(req) {
     return new Promise((resolve, reject) => {
-      // @ts-ignore: db is non-null when useIdb is true
-      const tx = db.transaction(STORE_NAME, "readonly");
-      const req = tx.objectStore(STORE_NAME).count();
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
     });
   }
 
+  /** @param {IDBTransaction} tx @returns {Promise<void>} */
+  function txDone(tx) {
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve(undefined);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  }
+
+  /** @returns {Promise<number>} */
+  function idbCount() {
+    // @ts-ignore: db is non-null when useIdb is true
+    const tx = db.transaction(STORE_NAME, "readonly");
+    return reqToPromise(tx.objectStore(STORE_NAME).count());
+  }
+
   /** @returns {Promise<any[]>} */
   function idbGetAll() {
-    return new Promise((resolve, reject) => {
-      // @ts-ignore: db is non-null when useIdb is true
-      const tx = db.transaction(STORE_NAME, "readonly");
-      const req = tx.objectStore(STORE_NAME).getAll();
-      // getAll() yields records in ascending key (serial) order.
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
+    // @ts-ignore: db is non-null when useIdb is true
+    const tx = db.transaction(STORE_NAME, "readonly");
+    // getAll() yields records in ascending key (serial) order.
+    return reqToPromise(tx.objectStore(STORE_NAME).getAll()).then(
+      (r) => r || [],
+    );
   }
 
   /**
@@ -232,14 +243,10 @@ window.webxdc = (() => {
    * @returns {Promise<void>}
    */
   function idbAppend(record) {
-    return new Promise((resolve, reject) => {
-      // @ts-ignore: db is non-null when useIdb is true
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put(record);
-      tx.oncomplete = () => resolve(undefined);
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
-    });
+    // @ts-ignore: db is non-null when useIdb is true
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(record);
+    return txDone(tx);
   }
 
   function deleteDatabase() {
@@ -314,7 +321,7 @@ window.webxdc = (() => {
     }
     const count = await idbCount();
     if (count > 0) {
-      // IndexedDB already has data: no-op (do not touch legacy localStorage).
+      // Already migrated; must not re-touch legacy localStorage.
       return;
     }
     const legacy = window.localStorage.getItem(updatesKey);
@@ -336,21 +343,16 @@ window.webxdc = (() => {
       window.localStorage.removeItem(ephemeralUpdateKey);
       return;
     }
-    await new Promise((resolve, reject) => {
-      // @ts-ignore: db is non-null when useIdb is true
-      const tx = db.transaction(STORE_NAME, "readwrite");
-      const store = tx.objectStore(STORE_NAME);
-      parsed.forEach((update, index) => {
-        if (update && typeof update.serial !== "number") {
-          update.serial = index + 1;
-        }
-        store.put(update);
-      });
-      tx.oncomplete = () => resolve(undefined);
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
+    // @ts-ignore: db is non-null when useIdb is true
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    const store = tx.objectStore(STORE_NAME);
+    parsed.forEach((update, index) => {
+      if (update && typeof update.serial !== "number") {
+        update.serial = index + 1;
+      }
+      store.put(update);
     });
-    // Only now that the import transaction has committed:
+    await txDone(tx);
     window.localStorage.removeItem(updatesKey);
     window.localStorage.removeItem(ephemeralUpdateKey);
   }
@@ -436,16 +438,15 @@ window.webxdc = (() => {
   // turn collapse into a single later delivery batch.
   function flushDelivery() {
     deliverScheduled = false;
-    if (!listenerSet) {
+    if (updateListener === noopListener) {
       return;
     }
-    const maxSerial = sessionLog.length;
     sessionLog.forEach((update) => {
       if (
         typeof update.serial === "number" &&
         update.serial > lastDeliveredSerial
       ) {
-        update.max_serial = maxSerial;
+        update.max_serial = serialCounter;
         lastDeliveredSerial = update.serial;
         updateListener(update);
       }
@@ -634,7 +635,6 @@ window.webxdc = (() => {
       enqueue(async () => {
         await ready;
         updateListener = cb;
-        listenerSet = true;
         lastDeliveredSerial = serial;
         flushDelivery();
       }),
