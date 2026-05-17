@@ -1,7 +1,7 @@
 {
   "name": "@webxdc/vite-plugins",
   "description": "Collection of vite plugins for webxdc development",
-  "version": "1.6.1-fork.3",
+  "version": "1.6.1-fork.4",
   "license": "MIT",
   "author": "adbenitez",
   "keywords": [
