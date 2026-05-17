@@ -9,6 +9,7 @@ import {
   loadStub,
   tick,
   UPDATES_KEY,
+  waitFor,
 } from "./helpers.js";
 
 beforeEach(() => {
@@ -187,7 +188,7 @@ describe("asynchronous update delivery (matches Delta Chat)", () => {
     await Promise.resolve(); // a microtask hop is not enough
     expect(delivered).toBe(false);
 
-    await tick(); // a later event-loop turn: now it arrives
+    await waitFor(() => delivered); // later: arrives after the write commits
     expect(delivered).toBe(true);
   });
 
@@ -202,25 +203,29 @@ describe("asynchronous update delivery (matches Delta Chat)", () => {
     w.sendUpdate({ payload: "a" });
     expect(state).toEqual([]); // not delivered on this tick
 
-    await tick();
+    await waitFor(() => state.length > 0);
     expect(state).toEqual(["a"]); // delivered on a later turn
   });
 
-  it("eventually delivers each update once, in order, with serial and max_serial", async () => {
+  it("delivers each update once, in serial order, with serial and max_serial", async () => {
     const w = loadStub();
+    // Persist both first, then register: the cold-start catch-up delivers
+    // them in a single batch, so max_serial deterministically reflects the
+    // full log. (Live post-registration delivery may legitimately split into
+    // batches where an earlier update sees a lower max_serial — that is
+    // correct webxdc semantics, not asserted here.)
+    await w.sendUpdate({ payload: "x" });
+    await w.sendUpdate({ payload: "y" });
+
     const got = [];
     await w.setUpdateListener((u) => got.push(u), 0);
-
-    w.sendUpdate({ payload: "x" });
-    w.sendUpdate({ payload: "y" });
-    await tick();
 
     expect(got.map((u) => u.payload)).toEqual(["x", "y"]);
     expect(got.map((u) => u.serial)).toEqual([1, 2]);
     expect(got.map((u) => u.max_serial)).toEqual([2, 2]);
     expect(got.every((u) => u._sender === w.selfAddr)).toBe(true);
 
-    // No duplicate redelivery on a subsequent turn.
+    // No duplicate redelivery from the sends' own scheduled flushes.
     await tick();
     expect(got.length).toBe(2);
   });

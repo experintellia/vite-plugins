@@ -12,13 +12,16 @@
 // must therefore not assume that an awaited `sendUpdate` means the listener has
 // already observed that update.
 //
-// An in-memory session log + serial counter is the source of truth for serial
-// assignment and replay; it is seeded from IndexedDB once the backend is ready.
-// IndexedDB (one record per update, keyed by `serial`) is written in the
-// background so long dev sessions are not bounded by the ~5 MB localStorage
-// quota, and is the source for cold-start replay. Cross-window sync uses a
-// BroadcastChannel because IndexedDB has no cross-document change event, with a
-// localStorage fallback when either is unavailable.
+// The serial is allocated inside the shared IndexedDB readwrite transaction
+// that persists the update (IndexedDB serializes overlapping readwrite
+// transactions across same-origin windows), so concurrent sends from multiple
+// windows never collide a serial. An in-memory log seeded from IndexedDB is the
+// source for cold-start replay; updates are delivered to the listener strictly
+// in serial order. IndexedDB (one record per update, keyed by `serial`) keeps
+// long dev sessions from being bounded by the ~5 MB localStorage quota.
+// Cross-window sync uses a BroadcastChannel because IndexedDB has no
+// cross-document change event, with a localStorage fallback when either is
+// unavailable.
 
 // @ts-check
 /** @typedef {import('@webxdc/types/global')} */
@@ -156,21 +159,19 @@ window.webxdc = (() => {
 
   const noopListener = (_) => {};
   let updateListener = noopListener;
-  // Highest serial already handed to the listener. Updates are delivered (on a
-  // later event-loop turn) only when serial > this, so a record that is both
-  // replayed and broadcast is never delivered twice.
+  // Highest serial handed to the listener. Delivery is strictly in serial
+  // order: flushDelivery delivers lastDeliveredSerial+1, +2, … and stops at a
+  // gap (a not-yet-arrived serial), so an out-of-order broadcast is buffered
+  // and reordered rather than skipped, and nothing is delivered twice.
   let lastDeliveredSerial = 0;
   let deliverScheduled = false;
-  // In-memory source of truth for serial assignment and replay, seeded from the
-  // persisted log once the backend is ready (see `ready`). Serials come from
-  // `serialCounter` (not an awaited IndexedDB count); IndexedDB is written in
-  // the background. The in-memory counter means two windows sending in the
-  // exact same tick could collide a serial — an accepted trade-off in this
-  // dev-only simulator; receiving a peer broadcast advances the counter to
-  // narrow that window.
+  // In-memory replay log, seeded from the persisted log once the backend is
+  // ready (see `ready`). Serials are NOT assigned here: they are allocated
+  // inside the shared IndexedDB readwrite transaction at write time (see
+  // `idbAppend`), which IndexedDB serializes across windows — so concurrent
+  // sends from multiple windows cannot collide a serial.
   /** @type {any[]} */
   let sessionLog = [];
-  let serialCounter = 0;
   /**
    * @type {RT | null}
    */
@@ -235,18 +236,30 @@ window.webxdc = (() => {
   }
 
   /**
-   * Persist a record whose `serial` was already assigned in memory. Writes are
-   * serialized by the op queue (see `enqueue`) for ordering; this only needs to
-   * `put`. Runs in the background — never on the `sendUpdate` echo path.
+   * Allocate the next serial and persist the record in one readwrite
+   * transaction. The serial is `max existing key + 1`, read inside the same
+   * transaction; IndexedDB serializes overlapping readwrite transactions across
+   * same-origin windows, so two windows sending concurrently get distinct
+   * serials. Mutates `record.serial` and resolves with it.
    *
    * @param {any} record
-   * @returns {Promise<void>}
+   * @returns {Promise<number>}
    */
   function idbAppend(record) {
-    // @ts-ignore: db is non-null when useIdb is true
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    tx.objectStore(STORE_NAME).put(record);
-    return txDone(tx);
+    return new Promise((resolve, reject) => {
+      // @ts-ignore: db is non-null when useIdb is true
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      const store = tx.objectStore(STORE_NAME);
+      const cursorReq = store.openCursor(null, "prev");
+      cursorReq.onsuccess = () => {
+        const cursor = cursorReq.result;
+        record.serial = (cursor ? Number(cursor.key) : 0) + 1;
+        store.put(record);
+      };
+      tx.oncomplete = () => resolve(record.serial);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
   }
 
   function deleteDatabase() {
@@ -290,11 +303,24 @@ window.webxdc = (() => {
       return [];
     }
   }
-  /** @param {any} record — `serial` already assigned in memory */
+  /**
+   * Allocate the next serial (max stored + 1) and append. localStorage has no
+   * atomic read-modify-write, so concurrent cross-tab writes can still race —
+   * the same inherent limitation as the original upstream stub; this path is
+   * only used when IndexedDB is unavailable. Mutates `record.serial`.
+   * @param {any} record
+   * @returns {number}
+   */
   function lsAppend(record) {
     const arr = lsGetAll();
+    const maxSerial = arr.reduce(
+      (m, u) => (typeof u.serial === "number" && u.serial > m ? u.serial : m),
+      0,
+    );
+    record.serial = maxSerial + 1;
     arr.push(record);
     window.localStorage.setItem(updatesKey, JSON.stringify(arr));
+    return record.serial;
   }
 
   /** @returns {Promise<any[]>} */
@@ -302,9 +328,9 @@ window.webxdc = (() => {
     return useIdb ? idbGetAll() : Promise.resolve(lsGetAll());
   }
   /**
-   * Persist a record (its `serial` is already assigned in memory).
+   * Allocate a serial and persist the record; resolves with the serial.
    * @param {any} record
-   * @returns {Promise<void>}
+   * @returns {Promise<number>}
    */
   function storeAppend(record) {
     return useIdb ? idbAppend(record) : Promise.resolve(lsAppend(record));
@@ -346,8 +372,11 @@ window.webxdc = (() => {
     // @ts-ignore: db is non-null when useIdb is true
     const tx = db.transaction(STORE_NAME, "readwrite");
     const store = tx.objectStore(STORE_NAME);
+    // Renumber by position (1-based), matching the upstream localStorage
+    // format where serial == array index + 1. Doing this unconditionally
+    // avoids duplicate serials from partially-serialized legacy data.
     parsed.forEach((update, index) => {
-      if (update && typeof update.serial !== "number") {
+      if (update) {
         update.serial = index + 1;
       }
       store.put(update);
@@ -380,8 +409,8 @@ window.webxdc = (() => {
     }
     try {
       const persisted = await storeGetAll();
-      // Merge (not overwrite): a synchronous `sendUpdate` may have already
-      // pushed entries before this seeding ran.
+      // Merge (not overwrite): a peer broadcast may have been ingested before
+      // this seeding ran.
       const known = new Set(sessionLog.map((u) => u.serial));
       (Array.isArray(persisted) ? persisted : []).forEach((u) => {
         if (typeof u.serial === "number" && known.has(u.serial)) {
@@ -390,11 +419,6 @@ window.webxdc = (() => {
         sessionLog.push(u);
       });
       sessionLog.sort((a, b) => (a.serial || 0) - (b.serial || 0));
-      sessionLog.forEach((u) => {
-        if (typeof u.serial === "number" && u.serial > serialCounter) {
-          serialCounter = u.serial;
-        }
-      });
     } catch (e) {}
   })();
 
@@ -415,42 +439,48 @@ window.webxdc = (() => {
     return result;
   }
 
-  // Record a peer's update in the in-memory log and advance the serial counter
-  // so this window's own subsequent sends don't collide, and a (re-)registered
-  // listener replays it. The sending window already persisted it to the shared
-  // IndexedDB, so this window must not write it again. Delivery to the listener
-  // happens later, via the delivery pump.
+  // Record a peer's update in the in-memory log so a (re-)registered listener
+  // replays it and the pump can deliver it. The sending window already
+  // persisted it to the shared IndexedDB, so this window must not write it
+  // again; the serial dedupe makes re-ingestion idempotent.
   /** @param {any} update */
   function ingestPeerUpdate(update) {
-    if (typeof update.serial === "number") {
-      if (sessionLog.some((u) => u.serial === update.serial)) {
-        return;
-      }
-      if (update.serial > serialCounter) {
-        serialCounter = update.serial;
-      }
+    if (
+      typeof update.serial === "number" &&
+      sessionLog.some((u) => u.serial === update.serial)
+    ) {
+      return;
     }
     sessionLog.push(update);
   }
 
-  // Deliver every not-yet-delivered logged update to the listener, in serial
-  // order. Idempotent and self-coalescing: multiple sends/peer messages in one
-  // turn collapse into a single later delivery batch.
+  // Deliver logged updates strictly in serial order, contiguous from
+  // lastDeliveredSerial. Stops at the first gap so an out-of-order broadcast is
+  // buffered until the missing serial arrives (then a later flush continues),
+  // rather than being skipped. Idempotent and self-coalescing.
   function flushDelivery() {
     deliverScheduled = false;
     if (updateListener === noopListener) {
       return;
     }
-    sessionLog.forEach((update) => {
+    sessionLog.sort((a, b) => (a.serial || 0) - (b.serial || 0));
+    const maxSerial = sessionLog.length
+      ? sessionLog[sessionLog.length - 1].serial
+      : 0;
+    for (const update of sessionLog) {
       if (
-        typeof update.serial === "number" &&
-        update.serial > lastDeliveredSerial
+        typeof update.serial !== "number" ||
+        update.serial <= lastDeliveredSerial
       ) {
-        update.max_serial = serialCounter;
-        lastDeliveredSerial = update.serial;
-        updateListener(update);
+        continue;
       }
-    });
+      if (update.serial !== lastDeliveredSerial + 1) {
+        break;
+      }
+      update.max_serial = maxSerial;
+      lastDeliveredSerial = update.serial;
+      updateListener(update);
+    }
   }
 
   // Schedule delivery on a later event-loop turn (never synchronous), modeling
@@ -652,11 +682,12 @@ window.webxdc = (() => {
       console.log("[Webxdc] WARNING: getAllUpdates() is deprecated.");
       return Promise.resolve([]);
     },
-    // The update is NOT echoed to the local listener synchronously: like Delta
-    // Chat, the listener fires on a later event-loop turn (see scheduleDelivery)
-    // — an awaited `sendUpdate` does not mean the listener has observed it yet.
-    // The returned Promise resolves once the background IndexedDB write commits
-    // (so callers awaiting it get durability before any reload).
+    // The serial is allocated by the shared IndexedDB write transaction, so the
+    // update is logged/broadcast/delivered only after that write commits — like
+    // Delta Chat, the listener fires on a later event-loop turn, never
+    // synchronously, and an awaited `sendUpdate` does not mean the listener has
+    // observed it yet. The returned Promise resolves once the write commits (so
+    // callers awaiting it get durability before any reload).
     sendUpdate: (update) => {
       /** @type {any} */
       const payload = {
@@ -667,22 +698,26 @@ window.webxdc = (() => {
         href: update.href,
         document: update.document,
       };
-      const serial = ++serialCounter;
       /** @type {any} */
-      const _update = Object.assign({}, payload, { serial });
-      console.log(`[Webxdc] ${JSON.stringify(_update)}`);
-      _update._sender = window.webxdc.selfAddr;
-      sessionLog.push(_update);
-      // Persisted shape matches upstream (no max_serial; the pump assigns it at
-      // delivery time, per the receiver's log length).
-      const record = Object.assign({}, _update);
-      postToPeers({ type: MSG_UPDATE, update: _update });
-      scheduleDelivery();
+      const _update = Object.assign({}, payload, {
+        _sender: window.webxdc.selfAddr,
+      });
       return enqueue(async () => {
+        await ready;
+        let serial;
         try {
-          await ready;
-          await storeAppend(record);
-        } catch (e) {}
+          serial = await storeAppend(_update);
+        } catch (e) {
+          // Write failed (e.g. the DB was deleted by a concurrent Reset).
+          // Nothing was persisted, so deliver/broadcast nothing.
+          return;
+        }
+        sessionLog.push(_update);
+        console.log(
+          `[Webxdc] ${JSON.stringify(Object.assign({}, payload, { serial }))}`,
+        );
+        postToPeers({ type: MSG_UPDATE, update: _update });
+        scheduleDelivery();
       });
     },
     sendToChat: async (content) => {
