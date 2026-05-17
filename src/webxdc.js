@@ -5,15 +5,20 @@
 // file is not used and will automatically be replaced with a real one.
 // See https://docs.webxdc.org/spec.html#webxdc-api
 //
-// An in-memory session log + serial counter is the synchronous source of
-// truth: `sendUpdate` assigns the serial, echoes to the local listener, and
-// notifies peers on the same tick (matching the original upstream stub, which
-// downstream apps rely on), THEN persists to IndexedDB in the background.
-// IndexedDB (one record per update, keyed by `serial`) is used so long dev
-// sessions are not bounded by the ~5 MB localStorage quota and is the source
-// for cold-start replay. Cross-window sync uses a BroadcastChannel because
-// IndexedDB has no cross-document change event, with a localStorage fallback
-// when either is unavailable.
+// Update delivery is asynchronous, modeling the real environment (Delta Chat):
+// `sendUpdate` does NOT invoke the update listener synchronously. The listener
+// (for both your own updates and peers') fires on a *later* event-loop turn,
+// like Delta Chat delivering the update event after its IPC round-trip. Apps
+// must therefore not assume that an awaited `sendUpdate` means the listener has
+// already observed that update.
+//
+// An in-memory session log + serial counter is the source of truth for serial
+// assignment and replay; it is seeded from IndexedDB once the backend is ready.
+// IndexedDB (one record per update, keyed by `serial`) is written in the
+// background so long dev sessions are not bounded by the ~5 MB localStorage
+// quota, and is the source for cold-start replay. Cross-window sync uses a
+// BroadcastChannel because IndexedDB has no cross-document change event, with a
+// localStorage fallback when either is unavailable.
 
 // @ts-check
 /** @typedef {import('@webxdc/types/global')} */
@@ -151,23 +156,21 @@ window.webxdc = (() => {
 
   let updateListener = (_) => {};
   let listenerSet = false;
-  // Highest serial already handed to the real listener; used to dedupe so a
-  // cross-window broadcast is never delivered twice (once via replay from the
-  // shared store, once via the BroadcastChannel notification).
+  // Highest serial already handed to the listener. Updates are delivered (on a
+  // later event-loop turn) only when serial > this, so a record that is both
+  // replayed and broadcast is never delivered twice.
   let lastDeliveredSerial = 0;
-  // In-memory source of truth. The serial is assigned from `serialCounter`
-  // (NOT from an awaited IndexedDB count) so the local echo stays synchronous;
-  // IndexedDB is written in the background. Both are seeded from the persisted
-  // log once the backend is ready (see `ready`). The in-memory counter means
-  // two windows sending in the exact same tick could collide a serial — an
-  // accepted trade-off for the synchronous echo in this dev-only simulator;
-  // receiving a peer broadcast advances the counter to narrow that window.
+  let deliverScheduled = false;
+  // In-memory source of truth for serial assignment and replay, seeded from the
+  // persisted log once the backend is ready (see `ready`). Serials come from
+  // `serialCounter` (not an awaited IndexedDB count); IndexedDB is written in
+  // the background. The in-memory counter means two windows sending in the
+  // exact same tick could collide a serial — an accepted trade-off in this
+  // dev-only simulator; receiving a peer broadcast advances the counter to
+  // narrow that window.
   /** @type {any[]} */
   let sessionLog = [];
   let serialCounter = 0;
-  // Peer updates that arrived before `setUpdateListener` finished its replay.
-  /** @type {any[]} */
-  let pendingPeerUpdates = [];
   /**
    * @type {RT | null}
    */
@@ -413,7 +416,8 @@ window.webxdc = (() => {
   // Record a peer's update in the in-memory log and advance the serial counter
   // so this window's own subsequent sends don't collide, and a (re-)registered
   // listener replays it. The sending window already persisted it to the shared
-  // IndexedDB, so this window must not write it again.
+  // IndexedDB, so this window must not write it again. Delivery to the listener
+  // happens later, via the delivery pump.
   /** @param {any} update */
   function ingestPeerUpdate(update) {
     if (typeof update.serial === "number") {
@@ -425,26 +429,37 @@ window.webxdc = (() => {
       }
     }
     sessionLog.push(update);
-    update.max_serial = sessionLog.length;
   }
 
-  /** @param {any} update */
-  function deliverPeerUpdate(update) {
+  // Deliver every not-yet-delivered logged update to the listener, in serial
+  // order. Idempotent and self-coalescing: multiple sends/peer messages in one
+  // turn collapse into a single later delivery batch.
+  function flushDelivery() {
+    deliverScheduled = false;
     if (!listenerSet) {
-      // Buffer until setUpdateListener has replayed from the shared store.
-      pendingPeerUpdates.push(update);
       return;
     }
-    if (
-      typeof update.serial === "number" &&
-      update.serial <= lastDeliveredSerial
-    ) {
+    const maxSerial = sessionLog.length;
+    sessionLog.forEach((update) => {
+      if (
+        typeof update.serial === "number" &&
+        update.serial > lastDeliveredSerial
+      ) {
+        update.max_serial = maxSerial;
+        lastDeliveredSerial = update.serial;
+        updateListener(update);
+      }
+    });
+  }
+
+  // Schedule delivery on a later event-loop turn (never synchronous), modeling
+  // Delta Chat delivering the update event after its IPC round-trip.
+  function scheduleDelivery() {
+    if (deliverScheduled) {
       return;
     }
-    if (typeof update.serial === "number") {
-      lastDeliveredSerial = update.serial;
-    }
-    updateListener(update);
+    deliverScheduled = true;
+    setTimeout(flushDelivery, 0);
   }
 
   /** @param {{ type: string, [k: string]: any }} message */
@@ -467,7 +482,7 @@ window.webxdc = (() => {
         }
       }
       ingestPeerUpdate(update);
-      deliverPeerUpdate(update);
+      scheduleDelivery();
       return;
     }
     if (message.type === MSG_EPHEMERAL) {
@@ -611,26 +626,17 @@ window.webxdc = (() => {
     sendUpdateMaxSize: 999999,
     selfAddr: params.get("addr") || "device0@local.host",
     selfName: params.get("name") || "device0",
-    // Cold-start replay MAY be async (callers await the returned Promise); it
-    // reads the in-memory log, which `ready` seeds from the persisted store.
+    // Cold-start catch-up: the returned Promise resolves once the listener has
+    // been called with the backlog (serial > arg), matching the webxdc spec.
+    // It reads the in-memory log, which `ready` seeds from the persisted store.
+    // Updates arriving afterwards are delivered asynchronously by the pump.
     setUpdateListener: (cb, serial = 0) =>
       enqueue(async () => {
         await ready;
-        const maxSerial = sessionLog.length;
-        sessionLog.forEach((update) => {
-          if (update.serial > serial) {
-            update.max_serial = maxSerial;
-            cb(update);
-          }
-        });
         updateListener = cb;
         listenerSet = true;
-        lastDeliveredSerial = Math.max(serial, maxSerial);
-        // Flush peer updates that arrived during the async replay above;
-        // deliverPeerUpdate applies the same serial-based dedupe.
-        const buffered = pendingPeerUpdates;
-        pendingPeerUpdates = [];
-        buffered.forEach(deliverPeerUpdate);
+        lastDeliveredSerial = serial;
+        flushDelivery();
       }),
     joinRealtimeChannel: (cb) => {
       // @ts-ignore: is_trashed() is private
@@ -646,14 +652,11 @@ window.webxdc = (() => {
       console.log("[Webxdc] WARNING: getAllUpdates() is deprecated.");
       return Promise.resolve([]);
     },
-    // The local echo is fully synchronous (serial from the in-memory counter,
-    // listener invoked on the same tick before this returns) to match the
-    // original upstream stub; downstream apps that use setUpdateListener as
-    // their sole setState site rely on it. IndexedDB is written in the
-    // background — a slow/failed write never blocks, delays, or precedes the
-    // echo. The returned Promise resolves once that background write commits
-    // (so callers that await it also get durability before any reload), but
-    // state is already applied synchronously regardless of when it resolves.
+    // The update is NOT echoed to the local listener synchronously: like Delta
+    // Chat, the listener fires on a later event-loop turn (see scheduleDelivery)
+    // — an awaited `sendUpdate` does not mean the listener has observed it yet.
+    // The returned Promise resolves once the background IndexedDB write commits
+    // (so callers awaiting it get durability before any reload).
     sendUpdate: (update) => {
       /** @type {any} */
       const payload = {
@@ -670,13 +673,11 @@ window.webxdc = (() => {
       console.log(`[Webxdc] ${JSON.stringify(_update)}`);
       _update._sender = window.webxdc.selfAddr;
       sessionLog.push(_update);
-      // Snapshot the persisted shape (no max_serial, matching upstream) before
-      // the listener can mutate it.
+      // Persisted shape matches upstream (no max_serial; the pump assigns it at
+      // delivery time, per the receiver's log length).
       const record = Object.assign({}, _update);
-      _update.max_serial = serial;
-      lastDeliveredSerial = Math.max(lastDeliveredSerial, serial);
-      updateListener(_update);
       postToPeers({ type: MSG_UPDATE, update: _update });
+      scheduleDelivery();
       return enqueue(async () => {
         try {
           await ready;

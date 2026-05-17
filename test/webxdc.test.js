@@ -165,72 +165,75 @@ describe("graceful degradation without IndexedDB", () => {
   });
 });
 
-// Regression: an earlier IndexedDB rework deferred the local echo to a later
-// microtask (it awaited the IDB write / an awaited count() for the serial).
-// data_dealer uses setUpdateListener as its sole setState site with no
-// optimistic apply, so a deferred echo made an awaited action handler observe
-// stale state — 6 e2e tests failed deterministically. The echo must be
-// synchronous; persistence happens in the background.
-describe("synchronous local echo", () => {
-  it("invokes the listener on the same tick — before a pre-queued microtask and before the IDB write", async () => {
+// The stub must model Delta Chat's asynchronous delivery: sendUpdate does NOT
+// invoke the listener synchronously; it fires on a later event-loop turn (after
+// a simulated IPC round-trip). An app that treats `await sendUpdate()` as
+// "listener has observed it" (e.g. setUpdateListener as the sole setState site
+// with no optimistic apply) is relying on stub-only behavior that does not hold
+// against real Delta Chat. These tests pin the async contract so the simulator
+// stays faithful.
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("asynchronous update delivery (matches Delta Chat)", () => {
+  it("does NOT invoke the listener synchronously nor on the next microtask", async () => {
     const w = loadStub();
-    const order = [];
-    await w.setUpdateListener(() => order.push("echo"), 0);
+    let delivered = false;
+    await w.setUpdateListener(() => {
+      delivered = true;
+    }, 0);
 
-    // Queued *before* sendUpdate: a synchronous echo runs before it; a
-    // deferred (await-ed) echo would run after it.
-    Promise.resolve().then(() => order.push("microtask"));
+    w.sendUpdate({ payload: { v: 1 } });
+    expect(delivered).toBe(false); // same tick
 
-    let writeSettled = false;
-    const write = w.sendUpdate({ payload: { v: 1 } }).then(() => {
-      writeSettled = true;
-    });
-    order.push("after-call");
+    await Promise.resolve(); // a microtask hop is not enough
+    expect(delivered).toBe(false);
 
-    // Echo already happened, synchronously, on this tick:
-    expect(order).toEqual(["echo", "after-call"]);
-    // ...and the background IndexedDB write has not resolved yet:
-    expect(writeSettled).toBe(false);
+    await tick(); // a later event-loop turn: now it arrives
+    expect(delivered).toBe(true);
+  });
 
-    await write;
-    expect(order).toEqual(["echo", "after-call", "microtask"]);
-    expect(writeSettled).toBe(true);
+  it("a synchronous state read right after sendUpdate does NOT see the update (downstream bug surfaced, not masked)", async () => {
+    const w = loadStub();
+    const state = [];
+    // Mirrors data_dealer: setUpdateListener is the only place state is set,
+    // no optimistic local apply. Under faithful async delivery this is a bug
+    // in the app, and the simulator must expose it rather than hide it.
+    await w.setUpdateListener((u) => state.push(u.payload), 0);
 
-    // Durability: awaiting the returned promise guarantees the write
-    // committed, so a reload replays it.
-    const w2 = loadStub();
+    w.sendUpdate({ payload: "a" });
+    expect(state).toEqual([]); // not delivered on this tick
+
+    await tick();
+    expect(state).toEqual(["a"]); // delivered on a later turn
+  });
+
+  it("eventually delivers each update once, in order, with serial and max_serial", async () => {
+    const w = loadStub();
+    const got = [];
+    await w.setUpdateListener((u) => got.push(u), 0);
+
+    w.sendUpdate({ payload: "x" });
+    w.sendUpdate({ payload: "y" });
+    await tick();
+
+    expect(got.map((u) => u.payload)).toEqual(["x", "y"]);
+    expect(got.map((u) => u.serial)).toEqual([1, 2]);
+    expect(got.map((u) => u.max_serial)).toEqual([2, 2]);
+    expect(got.every((u) => u._sender === w.selfAddr)).toBe(true);
+
+    // No duplicate redelivery on a subsequent turn.
+    await tick();
+    expect(got.length).toBe(2);
+  });
+
+  it("persists in the background; an awaited sendUpdate is durable across reload", async () => {
+    const w = loadStub();
+    await w.sendUpdate({ payload: { v: 1 } });
+
+    const w2 = loadStub(); // simulated reload, same IndexedDB
     const got = [];
     await w2.setUpdateListener((u) => got.push(u), 0);
     expect(got.map((u) => u.serial)).toEqual([1]);
     expect(got.map((u) => u.payload)).toEqual([{ v: 1 }]);
-  });
-
-  it("an awaited sendUpdate then state read observes the update (the exact downstream failure)", async () => {
-    const w = loadStub();
-    const state = [];
-    // Mirrors data_dealer: setUpdateListener is the only place state is set;
-    // no optimistic local apply.
-    await w.setUpdateListener((u) => state.push(u.payload), 0);
-
-    await w.sendUpdate({ payload: "a" });
-    expect(state).toEqual(["a"]);
-    await w.sendUpdate({ payload: "b" });
-    expect(state).toEqual(["a", "b"]);
-  });
-
-  it("delivers serial and max_serial synchronously in the echoed update", async () => {
-    const w = loadStub();
-    let last = null;
-    await w.setUpdateListener((u) => {
-      last = u;
-    }, 0);
-
-    w.sendUpdate({ payload: "x" });
-    expect(last.serial).toBe(1);
-    expect(last.max_serial).toBe(1);
-    expect(last._sender).toBe(w.selfAddr);
-
-    w.sendUpdate({ payload: "y" });
-    expect(last.serial).toBe(2);
   });
 });
