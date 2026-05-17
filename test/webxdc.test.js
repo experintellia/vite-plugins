@@ -164,3 +164,73 @@ describe("graceful degradation without IndexedDB", () => {
     expect(stored.length).toBe(2);
   });
 });
+
+// Regression: an earlier IndexedDB rework deferred the local echo to a later
+// microtask (it awaited the IDB write / an awaited count() for the serial).
+// data_dealer uses setUpdateListener as its sole setState site with no
+// optimistic apply, so a deferred echo made an awaited action handler observe
+// stale state — 6 e2e tests failed deterministically. The echo must be
+// synchronous; persistence happens in the background.
+describe("synchronous local echo", () => {
+  it("invokes the listener on the same tick — before a pre-queued microtask and before the IDB write", async () => {
+    const w = loadStub();
+    const order = [];
+    await w.setUpdateListener(() => order.push("echo"), 0);
+
+    // Queued *before* sendUpdate: a synchronous echo runs before it; a
+    // deferred (await-ed) echo would run after it.
+    Promise.resolve().then(() => order.push("microtask"));
+
+    let writeSettled = false;
+    const write = w.sendUpdate({ payload: { v: 1 } }).then(() => {
+      writeSettled = true;
+    });
+    order.push("after-call");
+
+    // Echo already happened, synchronously, on this tick:
+    expect(order).toEqual(["echo", "after-call"]);
+    // ...and the background IndexedDB write has not resolved yet:
+    expect(writeSettled).toBe(false);
+
+    await write;
+    expect(order).toEqual(["echo", "after-call", "microtask"]);
+    expect(writeSettled).toBe(true);
+
+    // Durability: awaiting the returned promise guarantees the write
+    // committed, so a reload replays it.
+    const w2 = loadStub();
+    const got = [];
+    await w2.setUpdateListener((u) => got.push(u), 0);
+    expect(got.map((u) => u.serial)).toEqual([1]);
+    expect(got.map((u) => u.payload)).toEqual([{ v: 1 }]);
+  });
+
+  it("an awaited sendUpdate then state read observes the update (the exact downstream failure)", async () => {
+    const w = loadStub();
+    const state = [];
+    // Mirrors data_dealer: setUpdateListener is the only place state is set;
+    // no optimistic local apply.
+    await w.setUpdateListener((u) => state.push(u.payload), 0);
+
+    await w.sendUpdate({ payload: "a" });
+    expect(state).toEqual(["a"]);
+    await w.sendUpdate({ payload: "b" });
+    expect(state).toEqual(["a", "b"]);
+  });
+
+  it("delivers serial and max_serial synchronously in the echoed update", async () => {
+    const w = loadStub();
+    let last = null;
+    await w.setUpdateListener((u) => {
+      last = u;
+    }, 0);
+
+    w.sendUpdate({ payload: "x" });
+    expect(last.serial).toBe(1);
+    expect(last.max_serial).toBe(1);
+    expect(last._sender).toBe(w.selfAddr);
+
+    w.sendUpdate({ payload: "y" });
+    expect(last.serial).toBe(2);
+  });
+});
